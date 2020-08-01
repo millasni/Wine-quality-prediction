@@ -1,0 +1,1018 @@
+---
+title: "Wine quality prediction"
+author: "Liudmyla Kotusenko"
+date: "February 2020"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Installing and loading packages
+```{r}
+# install.packages("corrplot")
+# install.packages("e1071")
+# install.packages("ranger")
+# install.packages("caret")
+# install.packages("MLmetrics")
+# install.packages("ordinalForest")
+# install.packages("naivebayes")
+# install.packages("kernlab")
+# install.packages("ordinalNet")
+# install.packages("doParallel")
+# install.packages("rpartScore")
+# install.packages("xgboost")
+```
+
+```{r echo = FALSE}
+library(ggplot2)
+library(dplyr)
+# library(e1071)
+library(corrplot)
+library(ranger)
+library(caret)
+library("MLmetrics")
+library("ordinalForest")
+library(naivebayes)
+library("kernlab")
+library("ordinalNet")
+library("doParallel")
+library("rpartScore")
+library("xgboost")
+```
+
+
+## Reading in and exploring data
+
+```{r}
+datrain <- read.csv("~/HEC/!Advanced statistical learning - 80619A/homework_H2020/datrain.txt", sep="")
+
+summary(datrain)
+n = names(datrain)
+n = n[-12]
+```
+
+
+```{r}
+# check the distribution of Y - imbalanced class problem
+summary(as.factor(datrain$y))/2000
+barplot(summary(as.factor(datrain$y))/2000)
+```
+
+
+```{r}
+# look at the distributions of Xs
+for (i in n) {
+  print(i)
+  hist(datrain[[i]],main=paste(i))
+}
+```
+
+```{r}
+# look at the distributions of Xs
+for (i in n) {
+  print(i)
+  hist(log(datrain[[i]]),main=paste(i))
+}
+```
+
+```{r}
+# look at boxplots of Y vs other variables
+for (i in n) {
+  boxplot(datrain[[i]]~datrain$y,main=paste(i,"vs Y"))
+}
+```
+
+```{r}
+# look at boxplots of Y vs other variables and density plots of Xs vs Y
+for (i in n) {
+  plot =  ggplot(datrain,aes(x=datrain[,i],col=factor(y)))+
+    geom_density()+xlab(i)
+  print(plot)
+}
+```
+
+```{r}
+correl = cor(datrain)
+# cor of y with oher vars
+as.matrix(correl[12,])
+corrplot(correl)
+```
+
+```{r}
+options(digits=3)
+correl 
+```
+
+
+## Creating CV folds and train control
+Splitting our data set with 2000 observations randomly into a training and a test set did not work well. Depending on a random seed used to split the data, the test accuracy varied sometimes 10-15 percentage points for the same model type. The ranking of models by performance also changed from split to split. To select the best model, we cannot rely on the accuracy of a given validation set as our predictions have high variance. To get more reliable accuracy estimates, I use 10-fold cross-validation (CV) repeated 5 times. 
+
+```{r}
+train1 = datrain
+train1$y.fact = as.factor(datrain$y)
+# train1$y.fact = as.ordered(train$y)
+levels(train1$y.fact) = c("inferior","average","superior")
+table(train1$y.fact)/2000
+train1 = train1[-12]
+names(train1)
+```
+
+```{r}
+# 5 repeats of 10-fold CV
+set.seed(1234)
+myFolds <- createMultiFolds(datrain$y, k = 10, times=5)
+```
+
+```{r}
+# creating train control
+myControl <- trainControl(
+  summaryFunction = multiClassSummary,
+  classProbs = TRUE, 
+  verboseIter = TRUE,
+  savePredictions = TRUE,
+  index = myFolds,
+  allowParallel = TRUE
+)
+```
+
+
+## Fitting models with CV
+### Naive Bayes
+
+#### Trying some parameters picked up manually, as caret grid is too restrictive
+
+```{r}
+nbGrid = data.frame(
+  laplace = 0,
+  usekernel = TRUE,
+  adjust = c(0.1,0.2,0.3,0.4,0.5,1,1.5,2)
+)
+```
+
+```{r}
+nb1 <- train(
+  y.fact ~ .,
+  data = train1,
+  tuneGrid = nbGrid,
+  method = "naive_bayes",
+  trControl = myControl
+)
+```
+
+```{r}
+nb1
+```
+
+```{r}
+plot(nb1)
+```
+
+### Random Forests with ranger()
+```{r}
+RFgrid <- data.frame(
+  mtry = rep(c(2,3,4,5,7,11),each=2),#c(2:11)
+  splitrule = c("gini","extratrees"),
+  min.node.size = 5
+)
+```
+
+#### With class weights applied
+Calculate class weights
+```{r}
+max.cl.sh = max(prop.table(table(train$y)))
+w = as.numeric(max.cl.sh/prop.table(table(train$y))) # correct!!!
+w
+```
+
+
+```{r}
+set.seed(2222)
+rf1 <- train(
+  y.fact ~ .,
+  data = train1,
+  tuneGrid = RFgrid,
+  method = "ranger",
+  class.weights=w,
+  trControl = myControl
+)
+```
+
+```{r}
+rf1
+```
+
+
+```{r}
+plot(rf1)
+```
+
+
+#### No class weights applied
+
+```{r}
+set.seed(2222)
+rf2 <- train(
+  y.fact ~ .,
+  data = train1,
+  tuneGrid = RFgrid,
+  method = "ranger",
+  trControl = myControl
+)
+```
+
+```{r}
+rf2
+```
+
+
+
+```{r}
+plot(rf2)
+```
+
+```{r}
+rf2$pred %>%
+  filter(mtry==2, splitrule=="extratrees") %>%
+  summarize(mean.accuracy = mean(pred==obs))
+
+rf2.p = rf2$pred%>%
+  filter(mtry==2, splitrule=="extratrees") %>%
+  select(pred,obs)
+
+table(rf2.p$obs, rf2.p$pred)
+```
+
+### CART on ordinal responses
+
+#### Using cp parameters picked manually: 0,0.005,0.01 (ones from caret are not good)
+To run a CV (commented since takes about 1h)
+```{r}
+# Cart.ord.grid2 <- data.frame(
+#   cp = rep(c(0,0.005,0.01),each=4),
+#   split = rep(c("abs","quad"),6),
+#   prune = rep(rep(c("mr", "mc"),each=2),3)
+#   )
+```
+Using only params from the best model for faster training
+```{r}
+Cart.ord.grid2 <- data.frame(
+  cp = 0.005,
+  split = "abs",
+  prune = "mc"
+  )
+```
+
+```{r}
+CART.ord2 <- train(
+  y.fact ~ .,
+  data = train1,
+  tuneGrid = Cart.ord.grid2,
+  method = "rpartScore",
+  trControl = myControl
+)
+# Fitting cp = 0.005, split = abs, prune = mc on full training set
+```
+
+
+```{r}
+CART.ord2
+```
+
+```{r}
+plot(CART.ord2)
+```
+### XGBoost
+
+#### Tuning hyperparameters with a TREE, using all columns and all data points
+Takes about 1h, so commented.
+```{r}
+# XGB4.6.8.10.grid <- data.frame(
+#   nrounds = rep(seq(50,750,50),12), # 15 values of nrounds
+#   max_depth = rep(rep(c(4,6,8,10),each=15),3), 
+#   eta = rep(c(0.05,0.1,0.3),each=60), 
+#   gamma = 0, 
+#   colsample_bytree = 1, 
+#  min_child_weight = 1,
+#  subsample = 1
+#   )
+```
+
+Based on the best model from CV for faster running
+```{r}
+XGB4.6.8.10.grid <- data.frame(
+  nrounds = 250, 
+  max_depth = 8, 
+  eta = 0.05, 
+  gamma = 0, 
+  colsample_bytree = 1, 
+ min_child_weight = 1,
+ subsample = 1
+  )
+```
+
+```{r}
+set.seed(567)
+XGB4.6.8.10 <- train(
+  y.fact ~ .,
+  data = train1,
+  tuneGrid = XGB4.6.8.10.grid,
+  method = "xgbTree",
+  trControl = myControl
+)
+# The final values used for the model were nrounds = 250, max_depth = 8, eta = 0.05, gamma = 0, colsample_bytree =
+# 1, min_child_weight = 1 and subsample = 1.
+```
+
+
+```{r}
+XGB4.6.8.10 
+```
+
+```{r}
+plot(XGB4.6.8.10)
+```
+
+#### Using parameters list from caret with a LINEAR REGRESSION
+eXtreme Gradient Boosting (method = 'xgbLinear')
+Only the best model to run:
+```{r}
+set.seed(567)
+XGB.lin <- train(
+  y.fact ~ .,
+  data = train1,
+  tuneGrid = data.frame(nrounds = 50, lambda = 1e-04, alpha = 0, eta = 0.3), # should be commented for CV.
+  method = "xgbLinear",
+  trControl = myControl
+)
+# The final values used for the model were nrounds = 50, lambda = 1e-04, alpha = 0 and eta = 0.3.
+```
+
+```{r}
+XGB.lin
+```
+
+```{r}
+plot(XGB.lin)
+```
+
+### Adabag 
+```{r}
+# cls = makeCluster(4) 
+# registerDoParallel(cls)
+```
+
+#### Trying maxdepth=c(3,6,9,10,11,15)
+AdaBag with small maxdepth (1,2,3...) from caret tuning grid gives too low accuracy, so trying higher depths.
+```{r}
+# Adabag.grid1 <- data.frame(
+#   maxdepth=rep(c(3,6,9,10,11,15),3), mfinal=rep(c(50,100,150),each=6)
+#   )
+```
+
+
+```{r}
+# set.seed(567)
+# AdaBag1 <- train(
+#   y.fact ~ .,
+#   tuneGrid = Adabag.grid1,
+#   data = train1,
+#   method = "AdaBag",
+#   trControl = myControl
+# )
+# # The final values used for the model were mfinal = 150 and maxdepth = 11 on sample n=1500.
+```
+
+```{r}
+# AdaBag1
+```
+
+```{r}
+# plot(AdaBag1)
+```
+
+#### Trying maxdepth=c(12,14,16,18)
+
+```{r}
+# Adabag.grid2 <- data.frame(
+#   maxdepth=rep(c(12,14,16,18),3), mfinal=rep(c(50,100,150),each=4)
+#   )
+```
+
+
+```{r}
+# set.seed(567)
+# AdaBag2 <- train(
+#   y.fact ~ .,
+#   tuneGrid = Adabag.grid2,
+#   data = train1,
+#   method = "AdaBag",
+#   trControl = myControl
+# )
+# # The final values used for the model were mfinal = 150 and maxdepth = 14 on sample n=1500.
+```
+
+```{r}
+# AdaBag2
+```
+
+```{r}
+# plot(AdaBag2)
+```
+
+#### Trying maxdepth=15, final Adabag
+
+```{r}
+Adabag.grid3 <- data.frame(
+  maxdepth=15, mfinal=rep(c(50,100,150))
+  )
+```
+
+```{r}
+set.seed(567)
+AdaBag3 <- train(
+  y.fact ~ .,
+  tuneGrid = Adabag.grid3,
+  data = train1,
+  method = "AdaBag",
+  trControl = myControl
+)
+```
+
+```{r}
+AdaBag3
+```
+
+```{r}
+plot(AdaBag3)
+```
+
+### AdaBoost
+Tuning parameters:
+Number of Trees (mfinal, numeric)
+Max Tree Depth (maxdepth, numeric)
+Coefficient Type (coeflearn, character)
+```{r}
+# Adaboost.grid1 <- data.frame(
+#   maxdepth=rep(c(1,2,3,6),3), 
+#   mfinal=rep(c(50,100,150),each=4),
+#   coeflearn="Freund"
+#   )
+```
+
+```{r}
+# Runs about 2.5h, so commented.
+# set.seed(567)
+# AdaBoost1 <- train(
+#   y.fact ~ .,
+#   data = train1,
+#   tuneGrid = Adaboost.grid1, 
+#   method = "AdaBoost.M1",
+#   trControl = myControl
+# )
+# Fitting mfinal = 150, maxdepth = 6, coeflearn = Freund on full training set
+```
+
+```{r}
+# AdaBoost1
+```
+
+```{r}
+# plot(AdaBoost1)
+```
+
+```{r}
+Adaboost.grid2 <- data.frame(
+  maxdepth=rep(c(10),15), 
+  mfinal=seq(20,160,10),
+  coeflearn="Freund"
+  )
+```
+
+```{r}
+# still runs 30-40 mins
+set.seed(567)
+AdaBoost2 <- train(
+  y.fact ~ .,
+  data = train1,
+  tuneGrid = Adaboost.grid2,
+  method = "AdaBoost.M1",
+  trControl = myControl
+)
+# Fitting mfinal = 130, maxdepth = 10, coeflearn = Freund on full training set
+```
+
+```{r}
+AdaBoost2
+```
+
+```{r}
+plot(AdaBoost2)
+```
+
+### SVM
+
+#### Using linear kernel
+https://rdrr.io/cran/caret/man/models.html
+For classification and regression using package kernlab with tuning parameters:
+Cost (C, numeric)
+
+```{r}
+svc.grid1 <- data.frame(
+  # C=16
+  C=2^(seq(-2,5,1))
+  )
+```
+
+
+```{r}
+# Runs fast
+svc1 <- train(
+  y.fact ~ .,
+  data = train1,
+  tuneGrid = svc.grid1, 
+  method = "svmLinear",
+  # preProc = c("center", "scale"),
+  preProcess = "pca",
+  trControl = myControl
+)
+# The final value used for the model was C = 0.5 with PCA.
+# The final value used for the model was C = 0.25 with center/scale.
+# Valid. accuracy a bit higher with pca.
+# maximum number of iterations reached almost for every fold/run, so results are unsure.
+```
+
+
+```{r}
+svc1
+```
+
+```{r}
+plot(svc1)
+```
+
+
+#### Using radial kernel
+https://rdrr.io/cran/caret/man/models.html
+Support Vector Machines with Radial Basis Function Kernel (method = 'svmRadialCost')
+For classification and regression using package kernlab with tuning parameters:
+Cost (C, numeric)
+
+(tried polynomial kernel but it takes too long to run -> abandoned.)
+
+```{r}
+# Runs fast
+svc2 <- train(
+  y.fact ~ .,
+  data = train1,
+  tuneLength = 10,
+  method = "svmRadialCost",
+  preProc = c("center", "scale"),
+  trControl = myControl
+)
+# The final value used for the model was C = 16.
+```
+
+```{r}
+svc2
+```
+
+```{r}
+plot(svc2)
+```
+
+#### Using polynomial kernel
+https://rdrr.io/cran/caret/man/models.html
+For classification and regression using package kernlab with tuning parameters:
+Polynomial Degree (degree, numeric)
+Scale (scale, numeric)
+Cost (C, numeric)
+
+Runs fast with train tune grid, but it does not try high cost values (the best model has cost 0.25 though)
+```{r}
+svc3 <- train(
+  y.fact ~ .,
+  data = train1,
+  tuneGrid= data.frame(degree = 3, scale = 0.01, C = 0.25), # to comment for CV.
+  method = "svmPoly",
+  preProc = c("center", "scale"),
+  trControl = myControl
+)
+# Fitting degree = 3, scale = 0.01, C = 0.25 on full training set
+```
+
+```{r}
+svc3
+```
+
+```{r}
+plot(svc3)
+```
+
+
+
+### Ordinal forest 
+Ordginal forest is not supported by caret, so we will use the same folds as in CV to run this forest in a loop.
+Explore myFolds subsetting
+```{r}
+train[myFolds[[50]],]
+nrow(train[myFolds[[50]],])
+```
+
+```{r}
+train[-myFolds[[49]],]
+```
+
+#### Using mtry=5 with perffunction = "proportional"
+Preliminary exploration showed that with perffunction = "proportional" mtry 5,7,8 performed the best. 
+Using mtry=5 here
+
+50 folds run 2-3 hours, so commented.
+Mean accuracy on validation - 64.19
+Median accuracy on validation - 64.5
+```{r}
+# OF5.acc = NULL
+# OF5.conf.mat = list()
+# OF5.rec=data.frame(NULL)
+# OF5.prec=data.frame(NULL)
+# 
+# 
+# for (i in 1:length(myFolds)) {
+#   set.seed(2222)
+#   OF.prop = ordfor(depvar="y.fact", train1[myFolds[[i]],], nsets = 1000, ntreeperdiv = 100,
+#                    ntreefinal = 5000, perffunction = "proportional", nbest = 10,
+#                    naive = FALSE, num.threads = 8, npermtrial = 500,
+#                    permperdefault = FALSE, mtry = 5, min.node.size = 5,
+#                    replace = TRUE, keep.inbag = FALSE)
+#   # predict on the new data, collect only class predictions with $pred
+#   yhat = predict(OF.prop,newdata = train1[-myFolds[[i]],])$ypred
+# 
+#   yfact = train1[-myFolds[[i]],"y.fact"]
+#   
+#   # using custom function
+#   cm = conf.acc(yfact,yhat) # cm is a list
+#   OF5.conf.mat = c(OF5.conf.mat,cm[1])
+# 
+#   OF5.acc = c(OF5.acc,cm[[2]])
+#   print(paste(i,"accuracy:",cm[[2]]))
+#   
+#   OF5.rec = rbind(OF5.rec,cm[[3]])
+#   
+#   OF5.prec = rbind(OF5.prec,cm[[4]])
+# }
+```
+
+```{r}
+# mean(OF5.acc)
+# median(OF5.acc)
+# boxplot(OF5.acc)
+```
+
+### Ordinal regression with elastic net penalty (ordinalNet)
+
+#### Proportional odds
+https://rdrr.io/cran/caret/man/models.html
+Penalized Ordinal Regression (method = 'ordinalNet')
+Mixing Percentage (alpha, numeric)
+Selection Criterion (criteria, character)
+Link Function (link, character)
+
+In default setting, uses "parallelTerms = TRUE" (meaning proportional odds)
+  
+```{r}
+ORDgrid1 <- data.frame(
+  alpha = 0.3,
+  # alpha = rep(seq(0.1,0.9,0.2),each=2),
+  link = "logit",
+  # link = rep(c("logit","probit"),5),
+  criteria = "aic"
+  )
+```
+
+No pre-processing
+```{r}
+ord.en1 <- train(
+  y.fact ~ .,
+  data = train1,
+  # tuneLength = 10,
+  tuneGrid=ORDgrid1,
+  method = "ordinalNet",
+  trControl = myControl
+)
+# Fitting alpha = 0.3, criteria = aic, link = logit on full training set (on n=1350) 
+```
+
+```{r}
+ord.en1
+```
+
+Pre-processing: "center", "scale"
+
+```{r}
+ord.en1.2 <- train(
+  y.fact ~ .,
+  data = train1,
+  # tuneLength = 10,
+  tuneGrid=ORDgrid1,
+  method = "ordinalNet",
+  preProc = c("center", "scale"),
+  trControl = myControl
+)
+# Fitting alpha = 0.3, criteria = aic, link = logit on full training set (on n=1350) 
+```
+
+```{r}
+ord.en1.2
+```
+
+Pre-processing: PCA
+
+```{r}
+ord.en1.3 <- train(
+  y.fact ~ .,
+  data = train1,
+  # tuneLength = 10,
+  tuneGrid=ORDgrid1,
+  method = "ordinalNet",
+  preProc = "pca",
+  trControl = myControl
+)
+# Fitting alpha = 0.3, criteria = aic, link = logit on full training set (on n=1350) 
+```
+
+```{r}
+ord.en1.3
+```
+ 
+#### With nonprallel terms (non-proportional odds)
+
+Mixing Percentage (alpha, numeric)
+Selection Criterion (criteria, character)
+Link Function (link, character)
+```{r}
+ORDgrid2 <- data.frame(
+  alpha = 0.5,
+  # alpha = rep(seq(0.1,0.9,0.2),each=2),
+  link = "logit",
+  # link = rep(c("logit","probit"),5),
+  criteria = "aic"
+  )
+```
+
+Pre-processing: PCA
+```{r}
+# allow preprocessing and nonparallelTerms
+ord.en2 <- train(
+  y.fact ~ .,
+  data = train1,
+  tuneGrid = ORDgrid2,
+  method = "ordinalNet",
+  # preProc = c("center", "scale"),
+  preProcess = "pca",
+  trControl = myControl,
+  nonparallelTerms = TRUE
+)
+# The final values used for the model were alpha = 0.5, criteria = aic and link = logit.
+```
+
+```{r}
+ord.en2
+```
+
+No preprocessing
+```{r}
+# allow preprocessing and nonparallelTerms
+ord.en2.2 <- train(
+  y.fact ~ .,
+  data = train1,
+  tuneGrid = ORDgrid2,
+  method = "ordinalNet",
+  # preProc = c("center", "scale"),
+  trControl = myControl,
+  nonparallelTerms = TRUE
+)
+# The final values used for the model were alpha = 0.5, criteria = aic and link = logit.
+```
+
+```{r}
+ord.en2.2
+```
+
+Centering and scaling
+```{r}
+# allow preprocessing and nonparallelTerms
+ord.en2.3 <- train(
+  y.fact ~ .,
+  data = train1,
+  tuneGrid = ORDgrid2,
+  method = "ordinalNet",
+  preProc = c("center", "scale"),
+  trControl = myControl,
+  nonparallelTerms = TRUE
+)
+# The final values used for the model were alpha = 0.5, criteria = aic and link = logit.
+```
+
+```{r}
+ord.en2.3
+```
+
+## Comparing multiple models by accuracy
+
+### Caret summaries and testing models by  accuracy
+```{r}
+models <- resamples(list(NB = nb1, RF.classW = rf1, RF = rf2, CART.ord = CART.ord2,XGB.tree=XGB4.6.8.10,XGB.lin=XGB.lin, AdaBag = AdaBag3,AdaBoost = AdaBoost2,svmLinear = svc1,svmRadial = svc2,svmPoly = svc3,OrdReg.POM = ord.en1.3,OrdReg.nonPOM = ord.en2)) #
+summary(models)
+```
+
+```{r}
+bwplot(models, metric = "Accuracy")
+```
+
+Keep only top-6 models for comparison.
+```{r}
+models2 <- resamples(list(RF.classW = rf1, RF = rf2,XGB.tree=XGB4.6.8.10,XGB.lin=XGB.lin, AdaBag = AdaBag3,AdaBoost = AdaBoost2)) #
+```
+
+```{r}
+differences = diff(models2, test = t.test, confLevel = 0.95, adjustment = "bonferroni")
+# pdf("diff.pdf")
+dotplot(differences)
+# dev.off(dev.cur())
+```
+
+### Looking at ensembple prediction of top-5 models (majority voting)
+
+```{r}
+# useless command. extracts predictions for training data, getting almost 100% accuracy everywhere.
+
+pred = extractPrediction(list(RF.classW = rf1, RF = rf2,XGB.tree=XGB4.6.8.10,AdaBag = AdaBag3,AdaBoost = AdaBoost2))
+# also extractProb(list(models))
+
+pred %>%
+  group_by(object) %>%
+  summarize(mean.accuracy = mean(pred==obs))
+```
+Need to extract predictions on the VALIDATION manually from the best 5 models.
+```{r}
+rf2$pred %>%
+  filter(mtry==2, splitrule=="extratrees") %>%
+  summarize(mean.accuracy = mean(pred==obs))
+
+rf2.p = rf2$pred%>%
+  filter(mtry==2, splitrule=="extratrees") %>%
+  select(pred,obs)
+
+table(rf2.p$obs, rf2.p$pred)
+
+head(rf2.p)
+
+```
+
+```{r}
+rf1$pred %>%
+  filter(mtry==3, splitrule=="extratrees") %>%
+  summarize(mean.accuracy = mean(pred==obs))
+
+rf1.p = rf1$pred%>%
+  filter(mtry==3, splitrule=="extratrees") %>%
+  select(pred,obs)
+
+table(rf1.p$obs, rf1.p$pred)
+
+head(rf1.p)
+```
+
+```{r}
+AdaBag3$pred %>%
+  filter(mfinal==150) %>%
+  summarize(mean.accuracy = mean(pred==obs))
+
+AdaBag3.p = AdaBag3$pred%>%
+  filter(mfinal==150) %>%
+  select(pred,obs)
+
+table(AdaBag3.p$obs, AdaBag3.p$pred)
+head(AdaBag3.p)
+
+```
+
+
+```{r}
+AdaBoost2$pred %>%
+  filter(maxdepth==10, mfinal==130) %>%
+  summarize(mean.accuracy = mean(pred==obs))
+
+AdaBoost2.p = AdaBoost2$pred %>%
+  filter(maxdepth==10, mfinal==130) %>%
+  select(pred,obs)
+
+table(AdaBoost2.p$obs, AdaBoost2.p$pred)
+```
+
+```{r}
+XGB4.6.8.10$pred %>%
+  filter(nrounds == 250, max_depth == 8, eta == 0.05) %>%
+  summarize(mean.accuracy = mean(pred==obs))
+
+XGB4.6.8.10.p = XGB4.6.8.10$pred%>%
+  filter(nrounds == 250, max_depth == 8, eta == 0.05) %>%
+  select(pred,obs)
+
+table(XGB4.6.8.10.p$obs, XGB4.6.8.10.p$pred)
+head(XGB4.6.8.10.p)
+```
+
+Majority voting does not result in a better accuracy: 66.09% vs 66.51% in the best model (RF2).
+Will be going with the predictions by the best model.
+```{r}
+top5_pred = cbind(rf2.p$pred,rf1.p$pred,AdaBoost2.p$pred,XGB4.6.8.10.p$pred,AdaBag3.p$pred,rf2.p$obs)
+
+maj_vote = NULL
+for (i in 1:nrow(top5_pred)){
+  maj_vote = c(maj_vote, names(which.max(table(top5_pred[i,1:5]))))
+}
+
+# accuracy of majority voting prediction 
+mean(maj_vote==top5_pred[,6])
+
+```
+
+Comparing predictions between models
+```{r}
+# predictions of maj voting vs the best model coinside by 94.32%
+mean(maj_vote==top5_pred[,1])
+
+# predictions of two RFs coinside by 95.39%
+mean(top5_pred[,1]==top5_pred[,2])
+
+# confusion matrix for the best single model
+table(rf2.p$obs, rf2.p$pred)
+
+# confusion matrix for the majority voting with top-5 models
+
+table(rf2.p$obs, maj_vote)
+```
+
+## Predicting on the new data set
+
+```{r}
+test.set <- read.csv("~/HEC/!Advanced statistical learning - 80619A/homework_H2020/dateststudent.txt", sep="")
+nrow(test.set)
+```
+
+Explore a bit predictions of both RF on the validation set
+
+Weighted RF
+```{r}
+rf1.small = rf1$pred %>%
+  filter(mtry == 3, splitrule == "extratrees")
+
+table(rf1.small$obs,rf1.small$pred)/10000 # all 2000 cases predicted 5 times due to repeat CV
+prop.table(table(rf1.small$pred)) 
+```
+
+Non-weighted RF
+```{r}
+rf2.small = rf2$pred %>%
+  filter(mtry == 2, splitrule == "extratrees")
+
+table(rf2.small$obs,rf2.small$pred)/10000  
+prop.table(table(rf2.small$pred)) 
+
+```
+
+Predict on the test set using top-5 models
+```{r}
+prediction = predict(rf2, newdata = test.set) #non-weighted
+prediction1 = predict(rf1, newdata = test.set) #weighted
+prediction2 = predict(AdaBoost2, newdata = test.set) #weighted
+prediction3 = predict(XGB4.6.8.10, newdata = test.set) #weighted
+prediction4 = predict(AdaBag3, newdata = test.set) #weighted
+
+top5_pred_test = cbind(prediction,prediction1,prediction2,prediction3,prediction4)
+
+maj_vote_test = NULL
+for (i in 1:nrow(top5_pred_test)){
+  maj_vote_test = c(maj_vote_test, names(which.max(table(top5_pred_test[i,]))))
+}
+
+# predictions of maj voting vs the best model coinside by 94%
+mean(maj_vote_test==top5_pred_test[,1])
+```
+
+Since predictions of the best model coniside with those from the majority voting by 5 best models, but the best model has incrementally higher accuracy on the validation wet, use the best model to predict on the test set (random forest without weights)
+```{r}
+head(prediction)
+table(prediction)
+class(prediction)
+
+pred_numeric = as.numeric(prediction)
+table(pred_numeric)
+prop.table(table(pred_numeric)) # prop looks reasonably close to that on the valid. set. 
+```
+
