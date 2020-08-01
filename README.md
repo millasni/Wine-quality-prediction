@@ -24,3 +24,4 @@ to that function in caret::train are shown:
 Random Forest performed the best in this task and was one of the fastest. The accuracy on the test set (without labels) was 0.6729 and the result ranked 8th out of 107 students.
 The best result was 0.6781 also using caret & ranger. 
 
+The same code is given in .R and .Rmd format.
